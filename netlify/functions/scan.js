@@ -4,6 +4,21 @@ const UA_DESK = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (K
 const DOMAINS = ['alight.link', 'alightmotion.com', 'alightcreative.com', 'alightmotion.app.link', 'alight-creative.app.link', 'alightmotion.page.link'];
 const ALIGHT = new RegExp('(?:https?:\\/\\/)?(?:[a-z0-9-]+\\.)*(?:' + DOMAINS.map(d => d.replace(/\./g, '\\.')).join('|') + ')\\/[^\\s"\'<>\\\\)\\]]+', 'gi');
 
+const FILE = new RegExp('(?:https?:\\/\\/)?(?:[a-z0-9-]+\\.)*(?:drive\\.google\\.com|docs\\.google\\.com|mediafire\\.com|mega\\.nz|dropbox\\.com|sfile\\.mobi|catbox\\.moe)\\/[^\\s"\'<>\\\\)\\]]+', 'gi');
+
+function extractFiles(text) {
+  const clean = String(text || '').replace(/\\u002F/gi, '/').replace(/&amp;/g, '&');
+  const re = new RegExp(FILE.source, 'gi');
+  const out = [];
+  let m;
+  while ((m = re.exec(clean))) {
+    const url = m[0].replace(/[.,;:!?]+$/, '');
+    const tag = (clean.slice(Math.max(0, m.index - 60), m.index).match(/\d{1,2}:\d{1,2}/g) || []).pop() || '';
+    out.push({ url: /^https?:\/\//i.test(url) ? url : 'https://' + url, tag });
+  }
+  return out;
+}
+
 async function get(u, opts = {}, ms = 6000) {
   const c = new AbortController();
   const t = setTimeout(() => c.abort(), ms);
@@ -23,23 +38,22 @@ function extract(text) {
 }
 
 async function fetchComments(id, cookie, warnings) {
-  const comments = [];
-  try {
-    for (let cursor = 0; cursor < 100; cursor += 50) {
+  const pages = await Promise.all([0, 50, 100, 150, 200].map(async cursor => {
+    try {
       const r = await get(`https://www.tiktok.com/api/comment/list/?aid=1988&aweme_id=${id}&count=50&cursor=${cursor}`,
-        { headers: { cookie, referer: 'https://www.tiktok.com/' } });
+        { headers: { cookie, referer: 'https://www.tiktok.com/' } }, 6000);
       const d = await r.json();
-      if (!d.comments || !d.comments.length) break;
-      comments.push(...d.comments);
-      if (!d.has_more) break;
-    }
-  } catch (e) { /* handled below */ }
+      return d.comments || [];
+    } catch (e) { return []; }
+  }));
+  const seenIds = new Set();
+  const comments = pages.flat().filter(c => c && !seenIds.has(c.cid) && seenIds.add(c.cid));
   if (!comments.length) warnings.push('Komentar gak bisa diambil (TikTok sering ngeblok bagian ini), jadi komentar & balasan gak ikut dipindai.');
   return comments;
 }
 
 async function fetchReplies(id, cookie, comments) {
-  const withReplies = comments.filter(c => c.reply_comment_total > 0).slice(0, 20);
+  const withReplies = comments.filter(c => c.reply_comment_total > 0).slice(0, 40);
   const out = await Promise.all(withReplies.map(async c => {
     try {
       const r = await get(`https://www.tiktok.com/api/comment/list/reply/?aid=1988&comment_id=${c.cid}&item_id=${id}&count=50&cursor=0`,
@@ -52,6 +66,7 @@ async function fetchReplies(id, cookie, comments) {
 }
 
 exports.extract = extract;
+exports.extractFiles = extractFiles;
 
 exports.handler = async (event) => {
   const H = { 'content-type': 'application/json; charset=utf-8' };
@@ -144,10 +159,13 @@ exports.handler = async (event) => {
   }
 
   const seen = new Map();
-  for (const s of sources) for (const link of extract(s.text)) {
-    const k = link.toLowerCase();
-    if (!seen.has(k)) seen.set(k, { url: link, source: s.src });
+  const add = (url, source) => { const k = url.toLowerCase(); if (!seen.has(k)) seen.set(k, { url, source }); };
+  for (const s of sources) {
+    const al = extract(s.text);
+    al.forEach(link => add(link, s.src));
+    if (al.length) extractFiles(s.text).forEach(f => add(f.url, s.src + ' · XML' + (f.tag ? ' ' + f.tag : '')));
   }
+  warnings.push('[scan v4]');
 
   return send(200, {
     ok: true,
