@@ -1,4 +1,6 @@
+// Netlify Function: scan TikTok video (desc, bio, bio link, comments, replies) for Alight Motion preset links
 const UA = 'Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36';
+const UA_DESK = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36';
 const DOMAINS = ['alight.link', 'alightmotion.com', 'alightcreative.com', 'alightmotion.app.link', 'alight-creative.app.link', 'alightmotion.page.link'];
 const ALIGHT = new RegExp('(?:https?:\\/\\/)?(?:[a-z0-9-]+\\.)*(?:' + DOMAINS.map(d => d.replace(/\./g, '\\.')).join('|') + ')\\/[^\\s"\'<>\\\\)\\]]+', 'gi');
 
@@ -72,16 +74,28 @@ exports.handler = async (event) => {
   const cookies = typeof page.headers.getSetCookie === 'function'
     ? page.headers.getSetCookie().map(c => c.split(';')[0]).join('; ') : '';
 
+  const parseScope = (h, key) => {
+    const mm = h.match(/<script id="__UNIVERSAL_DATA_FOR_REHYDRATION__"[^>]*>([\s\S]*?)<\/script>/);
+    if (!mm) return null;
+    try { return JSON.parse(mm[1]).__DEFAULT_SCOPE__[key]; } catch (e) { return null; }
+  };
   let item = null;
-  const m = html.match(/<script id="__UNIVERSAL_DATA_FOR_REHYDRATION__"[^>]*>([\s\S]*?)<\/script>/);
-  if (m) {
-    try { item = JSON.parse(m[1]).__DEFAULT_SCOPE__['webapp.video-detail'].itemInfo.itemStruct; } catch (e) { item = null; }
+  const d1 = parseScope(html, 'webapp.video-detail');
+  if (d1 && d1.itemInfo) item = d1.itemInfo.itemStruct;
+  if (!item) {
+    try {
+      const r2 = await get(u.href, { headers: { 'user-agent': UA_DESK } }, 8000);
+      const d2 = parseScope(await r2.text(), 'webapp.video-detail');
+      if (d2 && d2.itemInfo) item = d2.itemInfo.itemStruct;
+    } catch (e) { /* lanjut ke cadangan */ }
   }
 
   const sources = [];
   let videoId = ((page.url || '').match(/\/video\/(\d+)/) || [])[1];
   let bioLink = '';
+  let gotInfo = false;
   if (item) {
+    gotInfo = true;
     videoId = videoId || item.id;
     const a = item.author || {};
     bioLink = (a.bioLink && a.bioLink.link) || '';
@@ -89,8 +103,31 @@ exports.handler = async (event) => {
     sources.push({ src: 'Bio akun', text: a.signature });
     sources.push({ src: 'Link di bio', text: bioLink });
   } else {
-    warnings.push('Data video gak kebaca (video private, dihapus, atau diblok TikTok). Cuma halaman mentahnya yang dipindai.');
+    let uname = '';
+    try {
+      const r = await get('https://www.tiktok.com/oembed?url=' + encodeURIComponent(page.url || u.href), {}, 6000);
+      const o = await r.json();
+      if (o.title) { sources.push({ src: 'Deskripsi video', text: o.title }); gotInfo = true; }
+      uname = o.author_unique_id || '';
+    } catch (e) { /* abaikan */ }
+    const mt = html.match(/<meta[^>]+(?:name|property)="(?:og:)?description"[^>]+content="([^"]*)"/i);
+    if (mt) { sources.push({ src: 'Deskripsi video', text: mt[1] }); gotInfo = true; }
+    if (!uname) { const um = (page.url || '').match(/tiktok\.com\/@([^/?]+)/); uname = um ? um[1] : ''; }
+    if (uname) {
+      try {
+        const r = await get('https://www.tiktok.com/@' + encodeURIComponent(uname), {}, 6000);
+        const du = parseScope(await r.text(), 'webapp.user-detail');
+        const usr = du && du.userInfo && du.userInfo.user;
+        if (usr) {
+          bioLink = (usr.bioLink && usr.bioLink.link) || '';
+          sources.push({ src: 'Bio akun', text: usr.signature });
+          sources.push({ src: 'Link di bio', text: bioLink });
+          gotInfo = true;
+        }
+      } catch (e) { /* abaikan */ }
+    }
     sources.push({ src: 'Halaman video', text: html });
+    if (!gotInfo) warnings.push('Deskripsi & bio akun gak kebaca (diblok TikTok atau video private). Komentar tetap dipindai.');
   }
 
   if (bioLink && /^https:\/\/[^/]*\.[^/]+/i.test(bioLink) && !/^https:\/\/(\d{1,3}\.){3}/.test(bioLink)) {
@@ -115,7 +152,7 @@ exports.handler = async (event) => {
   return send(200, {
     ok: true,
     presets: [...seen.values()],
-    scanned: { komentar: comments.length, balasan: replies.length, bio: !!item },
+    scanned: { komentar: comments.length, balasan: replies.length, bio: gotInfo },
     warnings,
   });
 };
